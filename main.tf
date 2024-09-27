@@ -467,3 +467,88 @@ module "elasticache_secondary" {
     Environment = "dev"
   }
 }
+
+module "sqs" {
+  source  = "terraform-aws-modules/sqs/aws"
+
+  name = "example"
+
+  create_dlq = true
+  redrive_policy = {
+    # default is 5 for this module
+    maxReceiveCount = 10
+  }
+
+  tags = {
+    Environment = "dev"
+  }
+}
+module "sns" {
+  source  = "terraform-aws-modules/sns/aws"
+  version = ">= 5.0"
+
+  name = "pub-sub"
+
+  topic_policy_statements = {
+    sqs = {
+      sid = "SQSSubscribe"
+      actions = [
+        "sns:Subscribe",
+        "sns:Receive",
+      ]
+
+      principals = [{
+        type        = "AWS"
+        identifiers = ["*"]
+      }]
+
+      conditions = [{
+        test     = "StringLike"
+        variable = "sns:Endpoint"
+        values   = [module.sqs.queue_arn]
+      }]
+    }
+  }
+
+  subscriptions = {
+    sqs = {
+      protocol = "sqs"
+      endpoint = module.sqs.queue_arn
+    }
+  }
+
+  tags = {
+    Environment = "dev"
+  }
+}
+
+module "sqs" {
+  source = "terraform-aws-modules/sqs/aws"
+
+  name = "pub-sub"
+
+  create_queue_policy = true
+  queue_policy_statements = {
+    sns = {
+      sid     = "SNSPublish"
+      actions = ["sqs:SendMessage"]
+
+      principals = [
+        {
+          type        = "Service"
+          identifiers = ["sns.amazonaws.com"]
+        }
+      ]
+
+      conditions = [{
+        test     = "ArnEquals"
+        variable = "aws:SourceArn"
+        values   = [module.sns.topic_arn]
+      }]
+    }
+  }
+
+  tags = {
+    Environment = "dev"
+  }
+}
