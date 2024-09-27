@@ -79,28 +79,131 @@ resource "aws_dynamodb_table" "basic-dynamodb-table" {
   }
 }
 
-resource "aws_ecs_service" "mongo" {
-  name            = "mongodb"
-  cluster         = aws_ecs_cluster.foo.id
-  task_definition = aws_ecs_task_definition.mongo.arn
-  desired_count   = 400
-  iam_role        = aws_iam_role.foo.arn
-  depends_on      = [aws_iam_role_policy.foo]
+module "ecs" {
+  source = "terraform-aws-modules/ecs/aws"
 
-  ordered_placement_strategy {
-    type  = "binpack"
-    field = "cpu"
+  cluster_name = "ecs-integrated"
+
+  cluster_configuration = {
+    execute_command_configuration = {
+      logging = "OVERRIDE"
+      log_configuration = {
+        cloud_watch_log_group_name = "/aws/ecs/aws-ec2"
+      }
+    }
   }
 
-  load_balancer {
-    target_group_arn = aws_lb_target_group.foo.arn
-    container_name   = "mongo"
-    container_port   = 8080
+  fargate_capacity_providers = {
+    FARGATE = {
+      default_capacity_provider_strategy = {
+        weight = 50
+      }
+    }
+    FARGATE_SPOT = {
+      default_capacity_provider_strategy = {
+        weight = 50
+      }
+    }
   }
 
-  placement_constraints {
-    type       = "memberOf"
-    expression = "attribute:ecs.availability-zone in [us-west-2a, us-west-2b]"
+  services = {
+    ecsdemo-frontend = {
+      cpu    = 1024
+      memory = 4096
+
+      # Container definition(s)
+      container_definitions = {
+
+        fluent-bit = {
+          cpu       = 512
+          memory    = 1024
+          essential = true
+          image     = "906394416424.dkr.ecr.us-west-2.amazonaws.com/aws-for-fluent-bit:stable"
+          firelens_configuration = {
+            type = "fluentbit"
+          }
+          memory_reservation = 50
+        }
+
+        ecs-sample = {
+          cpu       = 512
+          memory    = 1024
+          essential = true
+          image     = "public.ecr.aws/aws-containers/ecsdemo-frontend:776fd50"
+          port_mappings = [
+            {
+              name          = "ecs-sample"
+              containerPort = 80
+              protocol      = "tcp"
+            }
+          ]
+
+          # Example image used requires access to write to root filesystem
+          readonly_root_filesystem = false
+
+          dependencies = [{
+            containerName = "fluent-bit"
+            condition     = "START"
+          }]
+
+          enable_cloudwatch_logging = false
+          log_configuration = {
+            logDriver = "awsfirelens"
+            options = {
+              Name                    = "firehose"
+              region                  = "eu-west-1"
+              delivery_stream         = "my-stream"
+              log-driver-buffer-limit = "2097152"
+            }
+          }
+          memory_reservation = 100
+        }
+      }
+
+      service_connect_configuration = {
+        namespace = "example"
+        service = {
+          client_alias = {
+            port     = 80
+            dns_name = "ecs-sample"
+          }
+          port_name      = "ecs-sample"
+          discovery_name = "ecs-sample"
+        }
+      }
+
+      load_balancer = {
+        service = {
+          target_group_arn = "arn:aws:elasticloadbalancing:eu-west-1:1234567890:targetgroup/bluegreentarget1/209a844cd01825a4"
+          container_name   = "ecs-sample"
+          container_port   = 80
+        }
+      }
+
+      subnet_ids = ["subnet-abcde012", "subnet-bcde012a", "subnet-fghi345a"]
+      security_group_rules = {
+        alb_ingress_3000 = {
+          type                     = "ingress"
+          from_port                = 80
+          to_port                  = 80
+          protocol                 = "tcp"
+          description              = "Service port"
+          source_security_group_id = "sg-12345678"
+        }
+        egress_all = {
+          type        = "egress"
+          from_port   = 0
+          to_port     = 0
+          protocol    = "-1"
+          cidr_blocks = ["0.0.0.0/0"]
+        }
+      }
+    }
+  }
+
+  tags = {
+    Environment = "Development"
+    Project     = "Example"
   }
 }
 
@@ -166,5 +269,201 @@ module "eks" {
   tags = {
     Environment = "dev"
     Terraform   = "true"
+  }
+}
+
+module "elasticache" {
+  source = "terraform-aws-modules/elasticache/aws"
+
+  cluster_id               = "example-redis"
+  create_cluster           = true
+  create_replication_group = false
+
+  engine_version = "7.1"
+  node_type      = "cache.t4g.small"
+
+  maintenance_window = "sun:05:00-sun:09:00"
+  apply_immediately  = true
+
+  # Security group
+  vpc_id = module.vpc.vpc_id
+  security_group_rules = {
+    ingress_vpc = {
+      # Default type is `ingress`
+      # Default port is based on the default engine port
+      description = "VPC traffic"
+      cidr_ipv4   = module.vpc.vpc_cidr_block
+    }
+  }
+
+  # Subnet Group
+  subnet_ids = module.vpc.private_subnets
+
+  # Parameter Group
+  create_parameter_group = true
+  parameter_group_family = "redis7"
+  parameters = [
+    {
+      name  = "latency-tracking"
+      value = "yes"
+    }
+  ]
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+  }
+}
+
+module "elasticache" {
+  source = "terraform-aws-modules/elasticache/aws"
+
+  cluster_id               = "example-memcached"
+  create_cluster           = true
+  create_replication_group = false
+
+  engine          = "memcached"
+  engine_version  = "1.6.17"
+  node_type       = "cache.t4g.small"
+  num_cache_nodes = 2
+  az_mode         = "cross-az"
+
+  maintenance_window = "sun:05:00-sun:09:00"
+  apply_immediately  = true
+
+  # Security group
+  vpc_id = module.vpc.vpc_id
+  security_group_rules = {
+    ingress_vpc = {
+      # Default type is `ingress`
+      # Default port is based on the default engine port
+      description = "VPC traffic"
+      cidr_ipv4   = module.vpc.vpc_cidr_block
+    }
+  }
+
+  # Subnet Group
+  subnet_ids = module.vpc.private_subnets
+
+  # Parameter Group
+  create_parameter_group = true
+  parameter_group_family = "memcached1.6"
+  parameters = [
+    {
+      name  = "idle_timeout"
+      value = 60
+    }
+  ]
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+  }
+}
+
+module "elasticache" {
+  source = "terraform-aws-modules/elasticache/aws"
+
+  replication_group_id = "example-redis-cluster"
+
+  # Cluster mode
+  cluster_mode_enabled       = true
+  num_node_groups            = 2
+  replicas_per_node_group    = 3
+  automatic_failover_enabled = true
+  multi_az_enabled           = true
+
+  maintenance_window = "sun:05:00-sun:09:00"
+  apply_immediately  = true
+
+  # Security group
+  vpc_id = module.vpc.vpc_id
+  security_group_rules = {
+    ingress_vpc = {
+      # Default type is `ingress`
+      # Default port is based on the default engine port
+      description = "VPC traffic"
+      cidr_ipv4   = module.vpc.vpc_cidr_block
+    }
+  }
+
+  # Subnet Group
+  subnet_ids = module.vpc.private_subnets
+
+  # Parameter Group
+  create_parameter_group = true
+  parameter_group_family = "redis7"
+  parameters = [
+    {
+      name  = "latency-tracking"
+      value = "yes"
+    }
+  ]
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+  }
+}
+module "elasticache_primary" {
+  source = "terraform-aws-modules/elasticache/aws"
+
+  replication_group_id                    = "example-redis-global-replication-group"
+  create_primary_global_replication_group = true
+
+  engine_version = "7.1"
+  node_type      = "cache.r7g.large"
+
+  # Security group
+  vpc_id = module.vpc.vpc_id
+  security_group_rules = {
+    ingress_vpc = {
+      # Default type is `ingress`
+      # Default port is based on the default engine port
+      description = "VPC traffic"
+      cidr_ipv4   = module.vpc.vpc_cidr_block
+    }
+  }
+
+  # Subnet Group
+  subnet_ids = module.vpc.private_subnets
+
+  # Parameter Group
+  create_parameter_group = true
+  parameter_group_family = "redis7"
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+  }
+}
+
+module "elasticache_secondary" {
+  source = "terraform-aws-modules/elasticache/aws"
+
+  providers = {
+    aws = aws.other_region
+  }
+
+  replication_group_id        = "example-redis-global-replication-group"
+  global_replication_group_id = module.elasticache_primary.global_replication_group_id
+
+  # Security group
+  vpc_id = module.vpc.vpc_id
+  security_group_rules = {
+    ingress_vpc = {
+      # Default type is `ingress`
+      # Default port is based on the default engine port
+      description = "VPC traffic"
+      cidr_ipv4   = module.vpc.vpc_cidr_block
+    }
+  }
+
+  # Subnet Group
+  subnet_ids = module.vpc.private_subnets
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
   }
 }
